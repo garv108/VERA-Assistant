@@ -224,27 +224,29 @@ async def vera_websocket(websocket: WebSocket):
     logger.info("✅ Frontend connected")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    input_queue: asyncio.Queue = asyncio.Queue()
 
     state = {
         "response_buffer": [],
         "history": [],
+        "queue": asyncio.Queue(),  # shared ref, replaced on each reconnect
     }
 
     async def read_from_frontend():
         try:
             while True:
                 raw = await websocket.receive_text()
-                await input_queue.put(json.loads(raw))
+                await state["queue"].put(json.loads(raw))
         except WebSocketDisconnect:
             logger.info("Frontend disconnected")
         except Exception as exc:
             logger.error(f"read_from_frontend: {exc}", exc_info=True)
         finally:
-            await input_queue.put(None)
+            await state["queue"].put(None)
 
     async def gemini_session_loop():
         while True:
+            # Fresh queue every reconnect — prevents stale None sentinel from prior session
+            state["queue"] = asyncio.Queue()
             logger.info(f"🔄 Opening session (history={len(state['history'])} turns)...")
             try:
                 async with client.aio.live.connect(
@@ -255,7 +257,7 @@ async def vera_websocket(websocket: WebSocket):
 
                     async def send_to_gemini():
                         while True:
-                            msg = await input_queue.get()
+                            msg = await state["queue"].get()
                             if msg is None:
                                 return
                             t = msg.get("type")
@@ -269,7 +271,7 @@ async def vera_websocket(websocket: WebSocket):
                                     )
                                 except Exception as exc:
                                     logger.warning(f"Audio send failed: {exc}")
-                                    await input_queue.put(None)
+                                    await state["queue"].put(None)
                                     return
                             elif t == "video":
                                 try:
@@ -374,7 +376,7 @@ async def vera_websocket(websocket: WebSocket):
                         return
 
                     logger.info("♻️  Reconnecting in 0.5s...")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.1)
 
             except Exception as exc:
                 logger.error(f"Session error: {exc}", exc_info=True)
