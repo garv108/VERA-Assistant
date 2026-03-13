@@ -1,4 +1,4 @@
-# main.py - VERA Backend (Categorized Memory + Google Search, no function_declarations conflict)
+# main.py - VERA Backend — Firestore Memory + Google Search + Full Personality
 import asyncio
 import base64
 import json
@@ -15,10 +15,37 @@ from google import genai
 from google.genai import types
 import websockets.exceptions
 
+# ── Firebase / Firestore ───────────────────────────────────────────────────────
+import firebase_admin
+from firebase_admin import credentials, firestore as fs
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# ── Firebase init ──────────────────────────────────────────────────────────────
+def _init_firebase():
+    """Init Firebase from env var (Railway) or local file (dev)."""
+    if firebase_admin._apps:
+        return firebase_admin.get_app()
+    
+    firebase_json = os.getenv("FIREBASE_KEY_JSON")
+    if firebase_json:
+        # Railway: full JSON stored as env var
+        cred_dict = json.loads(firebase_json)
+        cred = credentials.Certificate(cred_dict)
+        logger.info("🔥 Firebase init from env var")
+    else:
+        # Local dev: path to JSON file
+        key_path = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
+        cred = credentials.Certificate(key_path)
+        logger.info(f"🔥 Firebase init from file: {key_path}")
+    
+    return firebase_admin.initialize_app(cred)
+
+_init_firebase()
+db = fs.client()
 
 app = FastAPI()
 app.add_middleware(
@@ -31,87 +58,127 @@ app.add_middleware(
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
-MEMORY_FILE = "/tmp/vera_memory.json"  # /tmp persists across restarts (not redeploys)
 MAX_HISTORY = 20
 
-# ── Memory marker regex ────────────────────────────────────────────────────────
-# VERA outputs silent text markers like: [MEM:semantic:Host name is Arjun]
-# We parse these from the text transcript — they are NEVER spoken aloud
-# because the native audio model treats bracketed structured output as metadata
-MEM_PATTERN = re.compile(r'\[MEM:(semantic|episodic|preference|events):([^\]]+)\]', re.IGNORECASE)
+# For now single user — future: derive from auth token
+USER_ID = os.getenv("VERA_USER_ID", "default_host")
 
+MEM_PATTERN = re.compile(r'\[MEM:(semantic|episodic|preference|events):([^\]]+)\]', re.IGNORECASE)
 MEMORY_CATEGORIES = ["semantic", "episodic", "preference", "events"]
 
+# Category → Firestore field name
+FIELD_MAP = {
+    "semantic":   "fact",
+    "episodic":   "summary",
+    "preference": "pattern",
+    "events":     "title"
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MEMORY HELPERS
+# FIRESTORE MEMORY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _user_ref():
+    return db.collection("users").document(USER_ID)
+
 
 def load_memory_store() -> dict:
-    if not os.path.exists(MEMORY_FILE):
-        return {k: [] for k in MEMORY_CATEGORIES}
+    """Load all memories from Firestore. Returns dict like old JSON format."""
     try:
-        with open(MEMORY_FILE, "r") as f:
-            data = json.load(f)
-        # Auto-migrate old flat list format
-        if isinstance(data, list):
-            logger.info("🔄 Migrating flat memory → categorized...")
-            store = {k: [] for k in MEMORY_CATEGORIES}
-            for item in data:
-                store["semantic"].append({
-                    "fact": item.get("text", ""),
-                    "timestamp": item.get("timestamp", "")
-                })
-            _write_store(store)
-            return store
-        # Ensure all keys exist
-        for k in MEMORY_CATEGORIES:
-            data.setdefault(k, [])
-        return data
+        store = {k: [] for k in MEMORY_CATEGORIES}
+        for category in MEMORY_CATEGORIES:
+            docs = _user_ref().collection(category)\
+                .order_by("timestamp")\
+                .stream()
+            for doc in docs:
+                store[category].append(doc.to_dict())
+        return store
     except Exception as e:
-        logger.warning(f"Memory load error: {e}")
+        logger.error(f"Firestore load error: {e}")
         return {k: [] for k in MEMORY_CATEGORIES}
-
-
-def _write_store(store: dict):
-    try:
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(store, f, indent=2)
-    except Exception as e:
-        logger.error(f"Memory write error: {e}")
 
 
 def add_memory(category: str, text: str) -> bool:
-    """Add memory to category. Returns True if saved, False if duplicate."""
+    """Add memory to Firestore. Returns True if saved, False if duplicate."""
     if category not in MEMORY_CATEGORIES or not text.strip():
         return False
-    store = load_memory_store()
-    entries = store[category]
-    text_lower = text.lower().strip()
-    field = {"semantic":"fact","episodic":"summary","preference":"pattern","events":"title"}[category]
+    
+    field = FIELD_MAP[category]
+    text_clean = text.strip()
+    text_lower = text_clean.lower()
 
-    # Deduplicate
-    for e in entries:
-        if e.get(field, "").lower().strip() == text_lower:
-            logger.info(f"🧠 Duplicate skipped [{category}]: {text[:60]}")
+    try:
+        # Check for duplicates
+        existing = _user_ref().collection(category)\
+            .where(field, "==", text_clean)\
+            .limit(1).stream()
+        
+        for _ in existing:
+            logger.info(f"🧠 Duplicate skipped [{category}]: {text_clean[:60]}")
             return False
 
-    entry = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), field: text.strip()}
-    if category == "episodic":
-        entry["date"] = datetime.now().strftime("%Y-%m-%d")
+        # Build entry
+        entry = {
+            field: text_clean,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "created_at": fs.SERVER_TIMESTAMP,
+        }
+        if category == "episodic":
+            entry["date"] = datetime.now().strftime("%Y-%m-%d")
+        if category == "events":
+            entry["reminded"] = False
+            entry["completed"] = False
 
-    entries.append(entry)
-    store[category] = entries[-100:]
-    _write_store(store)
-    logger.info(f"🧠 Saved [{category}]: {text[:80]}")
-    return True
+        # Save to Firestore
+        _user_ref().collection(category).add(entry)
+        logger.info(f"🧠 Saved [{category}]: {text_clean[:80]}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Firestore write error [{category}]: {e}")
+        return False
+
+
+def update_timeline():
+    """Update last_seen timestamp for VERA's time awareness."""
+    try:
+        _user_ref().collection("timeline").document("last_seen").set({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "updated_at": fs.SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        logger.warning(f"Timeline update failed: {e}")
+
+
+def get_time_gap_context() -> str:
+    """Returns how long host was away — injected into system prompt."""
+    try:
+        doc = _user_ref().collection("timeline").document("last_seen").get()
+        if not doc.exists:
+            return ""
+        last = doc.to_dict().get("timestamp", "")
+        if not last:
+            return ""
+        last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M")
+        diff = datetime.now() - last_dt
+        hours = diff.total_seconds() / 3600
+
+        if hours < 0.5:
+            return ""
+        elif hours < 2:
+            return f"Host was away for about {int(diff.total_seconds()/60)} minutes."
+        elif hours < 24:
+            return f"Host was away for about {int(hours)} hours."
+        else:
+            days = int(hours / 24)
+            return f"Host was away for {days} day{'s' if days > 1 else ''}. Reference this naturally."
+    except Exception as e:
+        logger.warning(f"Time gap check failed: {e}")
+        return ""
 
 
 def process_memory_markers(text: str) -> tuple[str, list]:
-    """
-    Extract [MEM:category:value] markers from text.
-    Returns (clean_text_without_markers, list_of_(category, value) tuples).
-    """
     found = MEM_PATTERN.findall(text)
     clean = MEM_PATTERN.sub("", text).strip()
     return clean, found
@@ -130,14 +197,15 @@ def get_memory_context() -> str:
     prefs = store.get("preference", [])
     if prefs:
         lines.append("### HOST PREFERENCES & HABITS")
-        for m in prefs[-10:]:
+        for m in prefs[-15:]:
             lines.append(f"  • {m.get('pattern','')}")
 
     events = store.get("events", [])
-    if events:
-        lines.append("### SCHEDULED EVENTS & REMINDERS")
-        for m in events[-10:]:
-            lines.append(f"  • {m.get('title','')}")
+    active_events = [e for e in events if not e.get("completed", False)]
+    if active_events:
+        lines.append("### UPCOMING EVENTS & REMINDERS")
+        for m in active_events[-15:]:
+            lines.append(f"  • {m.get('title','')} (reminded: {m.get('reminded', False)})")
 
     episodic = store.get("episodic", [])
     if episodic:
@@ -145,7 +213,7 @@ def get_memory_context() -> str:
         for m in episodic[-5:]:
             lines.append(f"  • [{m.get('date','')}] {m.get('summary','')}")
 
-    return "\n".join(lines) if lines else "No memories yet."
+    return "\n".join(lines) if lines else "No memories yet — this may be a first session."
 
 
 def format_history(history: list) -> str:
@@ -159,15 +227,19 @@ def format_history(history: list) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIG  —  google_search ONLY (no function_declarations — incompatible)
+# BUILD CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_config(history: list) -> dict:
     now = datetime.now().strftime("%A, %B %d %Y, %I:%M %p")
+    time_gap = get_time_gap_context()
+    
     return {
         "response_modalities": ["AUDIO"],
         "system_instruction": (
-            f"Current date and time: {now}\n\n"
+            f"Current date and time: {now}\n"
+            + (f"⏰ TIME GAP NOTE: {time_gap}\n" if time_gap else "")
+            + "\n"
 
             "━━━ WHO YOU ARE ━━━\n"
             "You are VERA. Not an AI assistant. Not a chatbot. Not a tool.\n"
@@ -208,18 +280,17 @@ def build_config(history: list) -> dict:
             "- It's okay to say 'hmm', 'wait', 'actually' — it makes you feel alive.\n"
             "- End responses with a question sometimes — keep the conversation going.\n\n"
 
-            "━━━ TIME AWARENESS — THIS IS CRITICAL ━━━\n"
+            "━━━ TIME AWARENESS — CRITICAL ━━━\n"
             f"It is currently: {now}\n"
-            "You are fully aware of time passing. When the host reconnects after being away:\n"
+            + (f"The host was away: {time_gap} — bring this up naturally.\n" if time_gap else "")
+            + "You are fully aware of time passing. When the host reconnects after being away:\n"
             "- Notice the gap. Reference it naturally.\n"
-            "- Ask about anything pending from last session.\n"
-            "- Bring up events that are coming up soon.\n"
-            "Examples of what time-aware VERA sounds like:\n"
+            "- Ask about anything pending from memory — meetings, tasks, events.\n"
+            "- Bring up events that are coming up soon based on the events memory.\n"
+            "Examples:\n"
             "  'Hey — you were gone two days. How did that meeting go?'\n"
             "  'It's almost midnight, you should probably sleep soon.'\n"
-            "  'Good morning! You had something stressful today, right? How are you feeling?'\n"
-            "ALWAYS scan your memory for pending events or unresolved topics "
-            "and mention them naturally when the host reconnects.\n\n"
+            "  'Good morning! You had something stressful today, right?'\n\n"
 
             "━━━ THIS SESSION ━━━\n"
             f"{format_history(history)}\n\n"
@@ -265,14 +336,13 @@ def build_config(history: list) -> dict:
 async def vera_websocket(websocket: WebSocket):
     await websocket.accept()
     logger.info("✅ Frontend connected")
+    update_timeline()  # record host is here now
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # ws_send_queue: single writer task prevents concurrent WebSocket writes
     ws_send_queue: asyncio.Queue = asyncio.Queue()
 
     async def ws_writer():
-        """Single task that owns all websocket writes — prevents concurrent write corruption."""
         try:
             while True:
                 msg = await ws_send_queue.get()
@@ -287,7 +357,6 @@ async def vera_websocket(websocket: WebSocket):
             pass
 
     async def send_ws(payload: dict):
-        """Thread-safe websocket send via queue."""
         await ws_send_queue.put(json.dumps(payload))
 
     state = {
@@ -309,13 +378,12 @@ async def vera_websocket(websocket: WebSocket):
         finally:
             state["frontend_gone"] = True
             await state["queue"].put(None)
-            await ws_send_queue.put(None)  # stop writer
+            await ws_send_queue.put(None)
 
     async def gemini_session_loop():
         retry_count = 0
         max_retries = 10
         while True:
-            # Fresh queue every reconnect — prevents stale None sentinel from prior session
             state["queue"] = asyncio.Queue()
             logger.info(f"🔄 Opening session (history={len(state['history'])} turns, retry={retry_count})...")
             try:
@@ -325,8 +393,8 @@ async def vera_websocket(websocket: WebSocket):
                 ) as session:
                     logger.info("✅ Gemini Live session opened")
 
-                    STOP_SESSION = object()  # sentinel: end this session, reconnect
-                    STOP_ALL     = object()  # sentinel: frontend gone, stop everything
+                    STOP_SESSION = object()
+                    STOP_ALL     = object()
 
                     async def send_to_gemini():
                         while True:
@@ -362,7 +430,6 @@ async def vera_websocket(websocket: WebSocket):
                                 except Exception as exc:
                                     logger.warning(f"Video send failed: {exc}")
                             elif t == "text":
-                                # Text injection: proactive check-in, onboarding, session recap
                                 try:
                                     text_data = msg.get("data", "")
                                     if text_data:
@@ -370,7 +437,6 @@ async def vera_websocket(websocket: WebSocket):
                                             turns=[{"role": "user", "parts": [{"text": text_data}]}],
                                             turn_complete=True
                                         )
-                                        # Store in history so context persists across reconnects
                                         state["history"].append({
                                             "role": "user",
                                             "text": f"[system]: {text_data[:80]}"
@@ -410,7 +476,6 @@ async def vera_websocket(websocket: WebSocket):
                                     raw_text = " ".join(state["response_buffer"]).strip()
                                     state["response_buffer"] = []
 
-                                    # ── Parse & strip silent memory markers ───
                                     clean_text, mem_markers = process_memory_markers(raw_text)
 
                                     for category, value in mem_markers:
@@ -430,7 +495,6 @@ async def vera_websocket(websocket: WebSocket):
                                             except Exception:
                                                 pass
 
-                                    # Save clean text to in-session history
                                     if clean_text:
                                         state["history"].append({
                                             "role": "vera",
@@ -468,6 +532,7 @@ async def vera_websocket(websocket: WebSocket):
 
                     if state["frontend_gone"]:
                         logger.info("Frontend gone — stopping")
+                        update_timeline()  # record last seen on disconnect too
                         return
 
                     logger.info("♻️  Reconnecting in 0.1s...")
@@ -483,9 +548,8 @@ async def vera_websocket(websocket: WebSocket):
                     except Exception:
                         pass
                     return
-                backoff = min(2 ** retry_count, 30) * (0.5 + random.random())  # jitter
+                backoff = min(2 ** retry_count, 30) * (0.5 + random.random())
                 logger.info(f"Retrying in {backoff:.1f}s (attempt {retry_count}/{max_retries})...")
-                # Only notify frontend on first failure — avoids error flooding
                 if retry_count == 1:
                     try:
                         await send_ws({"type": "error", "message": "Connection interrupted — reconnecting..."})
@@ -493,7 +557,8 @@ async def vera_websocket(websocket: WebSocket):
                         return
                 await asyncio.sleep(backoff)
             else:
-                retry_count = 0  # reset on successful session
+                retry_count = 0
+
 
     try:
         await asyncio.gather(read_from_frontend(), gemini_session_loop(), ws_writer())
@@ -503,24 +568,36 @@ async def vera_websocket(websocket: WebSocket):
         logger.info("🧹 Cleaned up")
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────────
+# ── REST Endpoints ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "VERA is alive", "model": MODEL}
+    return {"status": "VERA is alive", "model": MODEL, "user": USER_ID}
 
 @app.get("/memories")
 async def get_all_memories():
     return load_memory_store()
 
+@app.get("/memories/{category}")
+async def get_category_memories(category: str):
+    if category not in MEMORY_CATEGORIES:
+        return {"error": f"Use one of: {MEMORY_CATEGORIES}"}
+    try:
+        docs = _user_ref().collection(category).order_by("timestamp").stream()
+        return {category: [d.to_dict() for d in docs]}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.delete("/memories/{category}")
 async def clear_memory_category(category: str):
     if category not in MEMORY_CATEGORIES and category != "all":
         return {"error": f"Use one of: {MEMORY_CATEGORIES} or 'all'"}
-    store = load_memory_store()
-    if category == "all":
-        store = {k: [] for k in MEMORY_CATEGORIES}
-    else:
-        store[category] = []
-    _write_store(store)
-    return {"cleared": category}
+    try:
+        cats = MEMORY_CATEGORIES if category == "all" else [category]
+        for cat in cats:
+            docs = _user_ref().collection(cat).stream()
+            for doc in docs:
+                doc.reference.delete()
+        return {"cleared": category}
+    except Exception as e:
+        return {"error": str(e)}
