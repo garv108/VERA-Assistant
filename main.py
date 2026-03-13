@@ -30,7 +30,7 @@ app.add_middleware(
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
-MEMORY_FILE = "vera_memory.json"
+MEMORY_FILE = "/tmp/vera_memory.json"  # /tmp persists across restarts (not redeploys)
 MAX_HISTORY = 20
 
 # ── Memory marker regex ────────────────────────────────────────────────────────
@@ -225,10 +225,33 @@ async def vera_websocket(websocket: WebSocket):
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
+    # ws_send_queue: single writer task prevents concurrent WebSocket writes
+    ws_send_queue: asyncio.Queue = asyncio.Queue()
+
+    async def ws_writer():
+        """Single task that owns all websocket writes — prevents concurrent write corruption."""
+        try:
+            while True:
+                msg = await ws_send_queue.get()
+                if msg is None:
+                    return
+                try:
+                    await websocket.send_text(msg)
+                except Exception as exc:
+                    logger.warning(f"WS write failed: {exc}")
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def send_ws(payload: dict):
+        """Thread-safe websocket send via queue."""
+        await ws_send_queue.put(json.dumps(payload))
+
     state = {
         "response_buffer": [],
         "history": [],
-        "queue": asyncio.Queue(),  # shared ref, replaced on each reconnect
+        "queue": asyncio.Queue(),
+        "frontend_gone": False,
     }
 
     async def read_from_frontend():
@@ -241,13 +264,17 @@ async def vera_websocket(websocket: WebSocket):
         except Exception as exc:
             logger.error(f"read_from_frontend: {exc}", exc_info=True)
         finally:
+            state["frontend_gone"] = True
             await state["queue"].put(None)
+            await ws_send_queue.put(None)  # stop writer
 
     async def gemini_session_loop():
+        retry_count = 0
+        max_retries = 10
         while True:
             # Fresh queue every reconnect — prevents stale None sentinel from prior session
             state["queue"] = asyncio.Queue()
-            logger.info(f"🔄 Opening session (history={len(state['history'])} turns)...")
+            logger.info(f"🔄 Opening session (history={len(state['history'])} turns, retry={retry_count})...")
             try:
                 async with client.aio.live.connect(
                     model=MODEL,
@@ -255,11 +282,19 @@ async def vera_websocket(websocket: WebSocket):
                 ) as session:
                     logger.info("✅ Gemini Live session opened")
 
+                    STOP_SESSION = object()  # sentinel: end this session, reconnect
+                    STOP_ALL     = object()  # sentinel: frontend gone, stop everything
+
                     async def send_to_gemini():
                         while True:
                             msg = await state["queue"].get()
-                            if msg is None:
+                            if msg is STOP_ALL:
                                 return
+                            if msg is STOP_SESSION or msg is None:
+                                return
+                            if not isinstance(msg, dict) or "type" not in msg:
+                                logger.warning(f"Invalid message format: {str(msg)[:100]}")
+                                continue
                             t = msg.get("type")
                             if t == "audio":
                                 try:
@@ -271,7 +306,7 @@ async def vera_websocket(websocket: WebSocket):
                                     )
                                 except Exception as exc:
                                     logger.warning(f"Audio send failed: {exc}")
-                                    await state["queue"].put(None)
+                                    await state["queue"].put(STOP_SESSION)
                                     return
                             elif t == "video":
                                 try:
@@ -283,11 +318,28 @@ async def vera_websocket(websocket: WebSocket):
                                     )
                                 except Exception as exc:
                                     logger.warning(f"Video send failed: {exc}")
+                            elif t == "text":
+                                # Text injection: proactive check-in, onboarding, session recap
+                                try:
+                                    text_data = msg.get("data", "")
+                                    if text_data:
+                                        await session.send_client_content(
+                                            turns=[{"role": "user", "parts": [{"text": text_data}]}],
+                                            turn_complete=True
+                                        )
+                                        # Store in history so context persists across reconnects
+                                        state["history"].append({
+                                            "role": "user",
+                                            "text": f"[system]: {text_data[:80]}"
+                                        })
+                                        logger.info(f"📝 Text injected: {text_data[:60]}")
+                                except Exception as exc:
+                                    logger.warning(f"Text inject failed: {exc}")
                             elif t == "ping":
                                 try:
-                                    await websocket.send_text(json.dumps({"type": "pong"}))
-                                except Exception:
-                                    pass
+                                    await send_ws({"type": "pong"})
+                                except Exception as exc:
+                                    logger.warning(f"Ping response failed: {exc}")
 
                     async def receive_from_gemini():
                         try:
@@ -301,12 +353,12 @@ async def vera_websocket(websocket: WebSocket):
                                 if model_turn:
                                     for part in model_turn.parts:
                                         if part.inline_data:
-                                            await websocket.send_text(json.dumps({
+                                            await send_ws({
                                                 "type": "audio",
                                                 "data": base64.b64encode(
                                                     part.inline_data.data
                                                 ).decode()
-                                            }))
+                                            })
                                             logger.info(f"🔊 {len(part.inline_data.data)}b")
                                         if part.text:
                                             state["response_buffer"].append(part.text)
@@ -326,12 +378,12 @@ async def vera_websocket(websocket: WebSocket):
                                                     "semantic":"👤","episodic":"📖",
                                                     "preference":"⚙️","events":"📅"
                                                 }
-                                                await websocket.send_text(json.dumps({
+                                                await send_ws({
                                                     "type": "memory_saved",
                                                     "category": category.lower(),
                                                     "icon": icons.get(category.lower(), "🧠"),
                                                     "text": value.strip()
-                                                }))
+                                                })
                                             except Exception:
                                                 pass
 
@@ -345,11 +397,11 @@ async def vera_websocket(websocket: WebSocket):
                                             state["history"] = state["history"][-(MAX_HISTORY * 2):]
                                         logger.info(f"✅ Turn done. History={len(state['history'])}")
 
-                                    await websocket.send_text(json.dumps({"type": "turn_complete"}))
+                                    await send_ws({"type": "turn_complete"})
 
                                 if getattr(sc, "interrupted", False):
                                     state["response_buffer"] = []
-                                    await websocket.send_text(json.dumps({"type": "interrupted"}))
+                                    await send_ws({"type": "interrupted"})
                                     logger.info("⚡ Interrupted")
 
                         except websockets.exceptions.ConnectionClosedError as exc:
@@ -371,25 +423,35 @@ async def vera_websocket(websocket: WebSocket):
                         except asyncio.CancelledError:
                             pass
 
-                    if t_send in done and t_send.exception() is None:
+                    if state["frontend_gone"]:
                         logger.info("Frontend gone — stopping")
                         return
 
-                    logger.info("♻️  Reconnecting in 0.5s...")
+                    logger.info("♻️  Reconnecting in 0.1s...")
                     await asyncio.sleep(0.1)
 
             except Exception as exc:
                 logger.error(f"Session error: {exc}", exc_info=True)
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"Max retries ({max_retries}) reached. Stopping.")
+                    try:
+                        await send_ws({"type": "error", "message": "VERA connection failed after max retries."})
+                    except Exception:
+                        pass
+                    return
+                backoff = min(2 ** retry_count, 30)  # exponential, capped at 30s
+                logger.info(f"Retrying in {backoff}s (attempt {retry_count}/{max_retries})...")
                 try:
-                    await websocket.send_text(json.dumps({
-                        "type": "error", "message": str(exc)
-                    }))
+                    await send_ws({"type": "error", "message": str(exc)})
                 except Exception:
                     return
-                await asyncio.sleep(2)
+                await asyncio.sleep(backoff)
+            else:
+                retry_count = 0  # reset on successful session
 
     try:
-        await asyncio.gather(read_from_frontend(), gemini_session_loop())
+        await asyncio.gather(read_from_frontend(), gemini_session_loop(), ws_writer())
     except Exception as exc:
         logger.error(f"Top-level error: {exc}", exc_info=True)
     finally:
