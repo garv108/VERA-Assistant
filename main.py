@@ -62,7 +62,8 @@ app.add_middleware(
 
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
 MODEL             = "gemini-2.5-flash-native-audio-preview-12-2025"
-MEMORY_MODEL      = "gemini-2.0-flash"   # fast text model for memory extraction
+MEMORY_MODEL        = "gemini-1.5-flash-8b"  # highest free-tier quota, perfect for extraction
+MEMORY_EXTRACT_EVERY = 3   # run memory extraction every N turns to avoid quota exhaustion
 MAX_HISTORY       = 30
 USER_ID           = os.getenv("VERA_USER_ID", "default_host")
 
@@ -273,49 +274,48 @@ async def extract_memories_from_transcript(
     send_ws_fn,
 ) -> None:
     """
-    After a turn completes, call gemini-flash (text) with the last exchange
-    and extract memory markers. Saves directly to Firestore.
-    Runs as a fire-and-forget background task — never blocks audio flow.
+    Background memory extraction using a lightweight text model.
+    - Runs every MEMORY_EXTRACT_EVERY turns (not every turn) to stay within quota.
+    - Retries once after 429 with the delay Gemini specifies.
+    - Never blocks the audio pipeline.
     """
     if not snippet.strip():
         return
-    try:
+
+    prompt = (
+        "You are a memory extraction system for an AI assistant called VERA.\n"
+        "Read the conversation snippet and extract ONLY genuinely important long-term facts.\n"
+        "Output ONLY memory markers, one per line, in this exact format. Nothing else.\n\n"
+        "[MEM:semantic:fact about who the host is — name, job, city, relationships]\n"
+        "[MEM:preference:how the host operates — habits, schedule, style, preferences]\n"
+        "[MEM:events:time-bound commitment — meeting, deadline, plan with date/time]\n"
+        "[MEM:speaker:person encountered — their name, context, relation to host]\n"
+        "[MEM:episodic:1-sentence summary of what was just discussed]\n\n"
+        "RULES:\n"
+        "- Only output markers. No explanation, no preamble, no extra text.\n"
+        "- Skip trivial exchanges (greetings, filler, short confirmations).\n"
+        "- If nothing worth saving was said, output nothing at all.\n"
+        "- One fact per marker.\n\n"
+        f"Conversation snippet:\n{snippet}"
+    )
+
+    icons = {
+        "semantic":   "👤",
+        "episodic":   "📖",
+        "preference": "⚙️",
+        "events":     "📅",
+        "speaker":    "🧑",
+    }
+
+    async def _run_extraction():
         text_client = genai.Client(api_key=GEMINI_API_KEY)
-
-        prompt = (
-            "You are a memory extraction system for an AI assistant called VERA.\n"
-            "Read the conversation snippet below and extract ONLY genuinely important facts.\n"
-            "Output memory markers in this EXACT format, one per line, nothing else:\n\n"
-            "[MEM:semantic:fact about who the host is — name, job, city, relationships]\n"
-            "[MEM:preference:how the host operates — habits, schedule, style, preferences]\n"
-            "[MEM:events:time-bound commitment — meeting, deadline, plan with date/time]\n"
-            "[MEM:speaker:person encountered — their name, context, relation to host]\n"
-            "[MEM:episodic:1-sentence summary of what was just discussed]\n\n"
-            "RULES:\n"
-            "- Only output markers. No explanation. No preamble.\n"
-            "- Only extract facts that are genuinely useful to remember long-term.\n"
-            "- If nothing important was said, output nothing at all.\n"
-            "- One fact per marker line.\n\n"
-            f"Conversation snippet:\n{snippet}"
-        )
-
         response = text_client.models.generate_content(
             model=MEMORY_MODEL,
             contents=prompt,
         )
-
         if not response.text:
             return
-
         _, markers = process_memory_markers(response.text)
-        icons = {
-            "semantic":   "👤",
-            "episodic":   "📖",
-            "preference": "⚙️",
-            "events":     "📅",
-            "speaker":    "🧑",
-        }
-
         for category, value in markers:
             saved = add_memory(category.lower(), value.strip())
             if saved:
@@ -329,8 +329,25 @@ async def extract_memories_from_transcript(
                 except Exception:
                     pass
 
+    try:
+        await _run_extraction()
     except Exception as e:
-        logger.warning(f"Memory extraction failed: {e}")
+        err_str = str(e)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            # Parse retry delay from error message, default 60s
+            delay = 60
+            import re as _re
+            m = _re.search(r"retryDelay.*?(\d+)s", err_str)
+            if m:
+                delay = int(m.group(1)) + 2
+            logger.warning(f"Memory quota hit — retrying in {delay}s")
+            await asyncio.sleep(delay)
+            try:
+                await _run_extraction()
+            except Exception as e2:
+                logger.warning(f"Memory extraction retry failed: {e2}")
+        else:
+            logger.warning(f"Memory extraction failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -676,10 +693,11 @@ async def vera_websocket(websocket: WebSocket):
         "history":              [],   # full conversation turns this session
         "queue":                asyncio.Queue(),
         "frontend_gone":        False,
+        "turn_count":           0,    # counts completed turns for memory throttling
+        "snippet_buffer":       [],   # accumulates exchanges between extractions
         # Buffers for transcription-based tracking
         "input_transcript":     [],   # what host said (transcribed)
         "output_transcript":    [],   # what VERA said (transcribed)
-        "turn_exchange":        [],   # last host+VERA exchange, used for memory extraction
     }
 
     async def read_from_frontend():
@@ -845,11 +863,16 @@ async def vera_websocket(websocket: WebSocket):
                                         snippet_parts.append(f"VERA: {vera_text}")
                                     snippet = "\n".join(snippet_parts)
 
-                                    # Fire-and-forget memory extraction
-                                    # Runs in background — never blocks audio
+                                    # Accumulate snippets and extract every N turns
                                     if snippet:
+                                        state["snippet_buffer"].append(snippet)
+                                    state["turn_count"] += 1
+
+                                    if state["turn_count"] % MEMORY_EXTRACT_EVERY == 0 and state["snippet_buffer"]:
+                                        combined = "\n---\n".join(state["snippet_buffer"])
+                                        state["snippet_buffer"] = []
                                         asyncio.create_task(
-                                            extract_memories_from_transcript(snippet, send_ws)
+                                            extract_memories_from_transcript(combined, send_ws)
                                         )
 
                                     logger.info(f"✅ Turn done. History={len(state['history'])}")
