@@ -62,7 +62,7 @@ app.add_middleware(
 
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
 MODEL             = "gemini-2.5-flash-native-audio-preview-12-2025"
-MEMORY_MODEL        = "gemini-1.5-flash-8b"  # highest free-tier quota, perfect for extraction
+MEMORY_MODEL        = "gemini-1.5-flash"  # correct model name, high free-tier quota
 MEMORY_EXTRACT_EVERY = 3   # run memory extraction every N turns to avoid quota exhaustion
 MAX_HISTORY       = 30
 USER_ID           = os.getenv("VERA_USER_ID", "default_host")
@@ -708,6 +708,15 @@ async def vera_websocket(websocket: WebSocket):
                 if isinstance(msg, dict) and msg.get("type") == "session_end":
                     logger.info("📝 Session end — saving log")
                     save_conversation_log(state["history"])
+                # Strip onboarding injection if host already has memories in Firestore
+                if isinstance(msg, dict) and msg.get("type") == "text":
+                    text_data = msg.get("data", "")
+                    if "[ONBOARDING]" in text_data:
+                        store = load_memory_store()
+                        total = sum(len(v) for v in store.values())
+                        if total > 0:
+                            logger.info(f"🧠 Skipping onboarding — {total} memories exist in Firestore")
+                            continue  # drop this message entirely
                 await state["queue"].put(msg)
         except WebSocketDisconnect:
             logger.info("Frontend disconnected")
