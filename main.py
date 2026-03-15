@@ -309,7 +309,7 @@ async def extract_memories_from_transcript(
 
     async def _run_extraction():
         text_client = genai.Client(api_key=GEMINI_API_KEY)
-        response = text_client.models.generate_content(
+        response = await text_client.aio.models.generate_content(
             model=MEMORY_MODEL,
             contents=prompt,
         )
