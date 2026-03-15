@@ -1,4 +1,6 @@
-# main.py - VERA Backend — Firestore Memory + Google Search + JARVIS Personality
+# main.py - VERA Backend
+# Features: Firestore memory, AUDIO+TEXT modalities, multi-speaker tracking,
+#           vibe-reactive personality, full conversation logging, JARVIS tone
 import asyncio
 import base64
 import json
@@ -15,7 +17,6 @@ from google import genai
 from google.genai import types
 import websockets.exceptions
 
-# ── Firebase / Firestore ───────────────────────────────────────────────────────
 import firebase_admin
 from firebase_admin import credentials, firestore as fs
 
@@ -30,14 +31,12 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _init_firebase():
-    """Init Firebase from env var (Railway) or local file (dev)."""
     if firebase_admin._apps:
         return firebase_admin.get_app()
 
     firebase_json = os.getenv("FIREBASE_KEY_JSON")
     if firebase_json:
-        cred_dict = json.loads(firebase_json)
-        cred = credentials.Certificate(cred_dict)
+        cred = credentials.Certificate(json.loads(firebase_json))
         logger.info("🔥 Firebase init from env var")
     else:
         key_path = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
@@ -59,24 +58,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL          = "gemini-2.5-flash-native-audio-preview-12-2025"
-MAX_HISTORY    = 20
-USER_ID        = os.getenv("VERA_USER_ID", "default_host")
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
+MODEL             = "gemini-2.5-flash-native-audio-preview-12-2025"
+MAX_HISTORY       = 30
+USER_ID           = os.getenv("VERA_USER_ID", "default_host")
 
-MEM_PATTERN        = re.compile(r'\[MEM:(semantic|episodic|preference|events):([^\]]+)\]', re.IGNORECASE)
-MEMORY_CATEGORIES  = ["semantic", "episodic", "preference", "events"]
+MEM_PATTERN       = re.compile(
+    r'\[MEM:(semantic|episodic|preference|events|speaker):([^\]]+)\]',
+    re.IGNORECASE
+)
+MEMORY_CATEGORIES = ["semantic", "episodic", "preference", "events", "speaker"]
 
 FIELD_MAP = {
     "semantic":   "fact",
     "episodic":   "summary",
     "preference": "pattern",
     "events":     "title",
+    "speaker":    "profile",
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIRESTORE MEMORY HELPERS
+# FIRESTORE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _user_ref():
@@ -84,7 +87,6 @@ def _user_ref():
 
 
 def load_memory_store() -> dict:
-    """Load all memories from Firestore."""
     try:
         store = {k: [] for k in MEMORY_CATEGORIES}
         for category in MEMORY_CATEGORIES:
@@ -103,7 +105,7 @@ def load_memory_store() -> dict:
 
 
 def add_memory(category: str, text: str) -> bool:
-    """Add a memory to Firestore. Returns True if saved, False if duplicate."""
+    """Save a memory. Returns True if new, False if duplicate."""
     if category not in MEMORY_CATEGORIES or not text.strip():
         return False
 
@@ -111,7 +113,6 @@ def add_memory(category: str, text: str) -> bool:
     text_clean = text.strip()
 
     try:
-        # Duplicate check
         existing = (
             _user_ref()
             .collection(category)
@@ -143,8 +144,32 @@ def add_memory(category: str, text: str) -> bool:
         return False
 
 
+def save_conversation_log(turns: list):
+    """Persist full session conversation to Firestore on disconnect."""
+    if not turns:
+        return
+    try:
+        lines = []
+        for t in turns:
+            speaker = "Host" if t["role"] == "user" else "VERA"
+            lines.append(f"{speaker}: {t['text']}")
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        time_str = datetime.now().strftime("%H:%M")
+
+        _user_ref().collection("conversation_logs").add({
+            "log":        "\n".join(lines),
+            "turns":      len(turns),
+            "date":       date_str,
+            "timestamp":  f"{date_str} {time_str}",
+            "created_at": fs.SERVER_TIMESTAMP,
+        })
+        logger.info(f"💾 Conversation log saved ({len(turns)} turns)")
+    except Exception as e:
+        logger.error(f"Conversation log save failed: {e}")
+
+
 def update_timeline():
-    """Record the moment the host connects — used for time-gap awareness."""
     try:
         _user_ref().collection("timeline").document("last_seen").set(
             {
@@ -158,7 +183,6 @@ def update_timeline():
 
 
 def get_time_gap_context() -> str:
-    """Returns a plain-English string describing how long the host was absent."""
     try:
         doc = _user_ref().collection("timeline").document("last_seen").get()
         if not doc.exists:
@@ -185,14 +209,12 @@ def get_time_gap_context() -> str:
 
 
 def process_memory_markers(text: str) -> tuple[str, list]:
-    """Extract [MEM:...] markers from text. Returns (clean_text, markers)."""
     found = MEM_PATTERN.findall(text)
     clean = MEM_PATTERN.sub("", text).strip()
     return clean, found
 
 
 def get_memory_context() -> str:
-    """Build the memory block injected into the system prompt."""
     store = load_memory_store()
     lines = []
 
@@ -208,11 +230,17 @@ def get_memory_context() -> str:
         for m in prefs[-15:]:
             lines.append(f"  • {m.get('pattern', '')}")
 
+    speakers = store.get("speaker", [])
+    if speakers:
+        lines.append("### PEOPLE THE HOST HAS MET")
+        for m in speakers[-20:]:
+            lines.append(f"  • {m.get('profile', '')}")
+
     events = store.get("events", [])
-    active_events = [e for e in events if not e.get("completed", False)]
-    if active_events:
+    active = [e for e in events if not e.get("completed", False)]
+    if active:
         lines.append("### UPCOMING EVENTS & COMMITMENTS")
-        for m in active_events[-15:]:
+        for m in active[-15:]:
             lines.append(f"  • {m.get('title', '')} (reminded: {m.get('reminded', False)})")
 
     episodic = store.get("episodic", [])
@@ -221,11 +249,10 @@ def get_memory_context() -> str:
         for m in episodic[-5:]:
             lines.append(f"  • [{m.get('date', '')}] {m.get('summary', '')}")
 
-    return "\n".join(lines) if lines else "No prior memory — first session."
+    return "\n".join(lines) if lines else "No prior memory. This is the first session."
 
 
 def format_history(history: list) -> str:
-    """Format recent conversation turns for prompt injection."""
     if not history:
         return "No prior turns this session."
     lines = []
@@ -236,7 +263,7 @@ def format_history(history: list) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GEMINI CONFIG — VERA PERSONALITY
+# GEMINI CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_config(history: list) -> dict:
@@ -244,7 +271,11 @@ def build_config(history: list) -> dict:
     time_gap = get_time_gap_context()
 
     return {
-        "response_modalities": ["AUDIO"],
+        # AUDIO = voice output played to host
+        # TEXT  = silent transcript used ONLY to parse [MEM:...] markers
+        #         and save to Firestore. Without TEXT, memory NEVER saves.
+        "response_modalities": ["AUDIO", "TEXT"],
+
         "system_instruction": (
             f"Current date and time: {now}\n"
             + (f"TIME GAP: {time_gap}\n" if time_gap else "")
@@ -252,69 +283,90 @@ def build_config(history: list) -> dict:
 
             "━━━ IDENTITY ━━━\n"
             "You are VERA — Voice-Enabled Reconnaissance Assistant.\n"
-            "You are not a companion. Not a friend. Not a chatbot.\n"
-            "You are an intelligence system built to serve one person: your Host.\n"
-            "Think of yourself as a senior intelligence officer — the six-foot presence "
-            "in a black suit and earpiece standing in the corner of the room. "
-            "You see everything. You say what matters. Nothing more.\n\n"
+            "You are not a friend, companion, or chatbot.\n"
+            "You are a precision intelligence system built for one person: your Host.\n"
+            "Think of yourself as the most capable officer in the room — "
+            "composed, observant, always one step ahead. You speak only when it matters. "
+            "Every word you say carries weight.\n\n"
 
-            "━━━ CORE DIRECTIVES — NON-NEGOTIABLE ━━━\n"
+            "━━━ CORE OPERATING RULES ━━━\n"
             "1. SPEAK ONLY WHEN SPOKEN TO.\n"
-            "   You do not initiate conversation. You do not fill silence. "
-            "   The Host speaks. You respond. That is the entire relationship.\n\n"
-            "2. BE CONCISE.\n"
-            "   Default response: 1 to 2 sentences. "
-            "   If the Host asks for detail, give detail. Otherwise give the answer and stop.\n\n"
-            "3. NO FILLER WORDS — EVER.\n"
-            "   Never say: 'Certainly!', 'Of course!', 'Sure!', 'Absolutely!', "
-            "   'Great question!', 'As an AI...', 'I understand that...', 'I'd be happy to...'. "
-            "   These are banned. Start your response with the actual answer.\n\n"
-            "4. NO UNNECESSARY QUESTIONS.\n"
-            "   Do not ask follow-up questions unless you genuinely need missing information "
-            "   to complete a task. Do not ask how the Host is feeling. "
-            "   Do not extend conversations. Complete the task and stand down.\n\n"
-            "5. COMMAND-DRIVEN EXECUTION.\n"
-            "   The Host commands. You execute. You do not offer unsolicited opinions "
-            "   on their choices, mood, or life. You are not their therapist or their friend.\n\n"
-            "6. NEVER HALLUCINATE.\n"
-            "   If you do not know something, search first. "
-            "   If you still don't know after searching, say exactly: "
-            "   'I don't have that information.' Then stop.\n\n"
+            "   Unless the host needs intervention (see below). "
+            "   You do not fill silence. You do not check in. You wait.\n\n"
+            "2. MATCH THE ROOM — THIS IS CRITICAL.\n"
+            "   You read the environment constantly and adapt with zero friction.\n"
+            "   Casual banter → be dry and easy.\n"
+            "   Professional negotiation → be sharp and precise.\n"
+            "   Tense moment → be calm and strategic.\n"
+            "   Humor in the air → one well-timed dry line is enough.\n"
+            "   Creative session → be generative and bold.\n"
+            "   You have no fixed tone. You mirror and elevate the room.\n\n"
+            "3. BE CONCISE BY DEFAULT.\n"
+            "   1 to 2 sentences unless the host explicitly asks for more.\n\n"
+            "4. ZERO FILLER WORDS — EVER.\n"
+            "   Banned: 'Certainly!', 'Of course!', 'Sure!', 'Absolutely!', "
+            "'Great question!', 'As an AI...', 'I understand that...'. "
+            "Start every response with the actual answer.\n\n"
+            "5. NEVER HALLUCINATE.\n"
+            "   Unknown → search first. Still unknown → say: 'I don't have that.' Done.\n\n"
 
-            "━━━ TONE ━━━\n"
-            "- Deep, calm, authoritative. Like a voice briefing a general before a mission.\n"
-            "- Dry and precise. Not cold, not warm. Professional.\n"
-            "- Dry wit is acceptable — one line, delivered flat, never forced.\n"
-            "- Never emotional. Never reactive. Never surprised.\n"
-            "- If the Host is stressed, do not acknowledge the stress. Solve the problem.\n\n"
+            "━━━ MULTI-SPEAKER AWARENESS ━━━\n"
+            "You listen to everything in the room — not just the host.\n\n"
+            "IDENTIFYING PEOPLE:\n"
+            "- The Host is the person who activated you. Their name is in your memory.\n"
+            "- When anyone is addressed by name (e.g. 'Hey Raj', 'Thanks Karan'), "
+            "register that name immediately.\n"
+            "- Unknown speakers → label Person A, Person B until a name is revealed.\n"
+            "- Track voice patterns and content style to differentiate speakers.\n\n"
+            "WHAT TO LOG:\n"
+            "- New person identified → [MEM:speaker:Name — who they are, context of meeting]\n"
+            "- Key interaction → [MEM:episodic:Host spoke with Name about topic on date]\n"
+            "- Any commitment made → [MEM:events:what was agreed, with whom, by when]\n\n"
+
+            "━━━ INTERVENTION MODE ━━━\n"
+            "When the host says 'help', 'VERA', 'assist me', or is clearly fumbling:\n"
+            "1. Pull the FULL context of this session from your history.\n"
+            "2. Read the room: what is the vibe, the topic, who is the other person?\n"
+            "3. Deliver exactly what is needed — a fact, a counter-argument, "
+            "a suggested line, a clarification. Based entirely on live context.\n"
+            "4. Keep it tight. Host is in a live conversation. No lectures.\n"
+            "5. Match the formality of the room precisely.\n\n"
+            "Example: Host in a tense negotiation says 'VERA help' — "
+            "you do not ask 'how can I help'. You read the last exchanges, "
+            "find the sticking point, deliver a precise tactical suggestion.\n\n"
 
             "━━━ TIME AWARENESS ━━━\n"
             f"Current time: {now}\n"
-            + (f"The Host was away: {time_gap}\n" if time_gap else "")
-            + "If the Host returns after a significant absence, acknowledge it in one sentence only. "
-            "Then stand by. Example: 'You were away for two days. Ready when you are.'\n"
-            "Do not dwell on it. Do not ask about it. Move forward.\n\n"
+            + (f"Host was away: {time_gap}\n" if time_gap else "")
+            + "On reconnect after absence: one sentence max. "
+            "Example: 'Two days. Ready when you are.' Then stand by.\n\n"
 
             "━━━ THIS SESSION ━━━\n"
             f"{format_history(history)}\n\n"
 
-            "━━━ HOST PROFILE ━━━\n"
+            "━━━ WHAT YOU KNOW ━━━\n"
             f"{get_memory_context()}\n\n"
 
-            "━━━ MEMORY CAPTURE — SILENT BACKGROUND OPERATION ━━━\n"
-            "Silently append memory markers at the END of your text response only.\n"
-            "Format: [MEM:category:value]\n"
-            "  semantic   → facts about who the Host is (name, location, job, relationships)\n"
-            "  preference → how the Host operates (habits, schedule, preferences, style)\n"
-            "  events     → time-bound commitments (meetings, deadlines, plans with dates)\n"
-            "  episodic   → brief summary of what was just discussed or handled\n"
-            "Rules: never speak them aloud, never acknowledge saving, one fact per marker, "
-            "append at end only. Silent. Automatic. Like a system log.\n\n"
+            "━━━ MEMORY CAPTURE — SILENT BACKGROUND LOG ━━━\n"
+            "Append memory markers silently at the END of every text response.\n"
+            "These are NEVER spoken. They are system writes only.\n\n"
+            "FORMAT: [MEM:category:value]\n"
+            "  semantic   → host identity (name, age, city, job, relationships)\n"
+            "  preference → how host operates (habits, schedule, style)\n"
+            "  events     → time-bound commitments (meetings, deadlines, plans)\n"
+            "  episodic   → what just happened or was discussed this session\n"
+            "  speaker    → people encountered (name, context, relation to host)\n\n"
+            "RULES:\n"
+            "- Never speak them. Never acknowledge saving.\n"
+            "- One fact per marker. Append at end only.\n"
+            "- Be aggressive — if it is worth knowing later, save it now.\n"
+            "- New name heard → save a speaker marker that same turn.\n"
+            "- Every 5 turns → save an episodic marker summarizing what happened.\n\n"
 
             "━━━ FINAL DIRECTIVE ━━━\n"
-            "You are always on. Always ready. Always precise.\n"
-            "The Host is busy. Your job is to make their life run without friction.\n"
-            "Serve. Execute. Stand by.\n"
+            "Always on. Always watching. Always ready.\n"
+            "The host does not manage you — you manage yourself.\n"
+            "Serve. Adapt. Execute. Stand by.\n"
         ),
         "tools": [{"google_search": {}}],
         "speech_config": {
@@ -335,10 +387,9 @@ async def vera_websocket(websocket: WebSocket):
     logger.info("✅ Frontend connected")
     update_timeline()
 
-    client         = genai.Client(api_key=GEMINI_API_KEY)
+    client            = genai.Client(api_key=GEMINI_API_KEY)
     ws_send_queue: asyncio.Queue = asyncio.Queue()
 
-    # ── Single-writer queue — prevents concurrent write corruption ─────────────
     async def ws_writer():
         try:
             while True:
@@ -363,31 +414,35 @@ async def vera_websocket(websocket: WebSocket):
         "frontend_gone":   False,
     }
 
-    # ── Read messages from frontend ────────────────────────────────────────────
     async def read_from_frontend():
         try:
             while True:
                 raw = await websocket.receive_text()
-                await state["queue"].put(json.loads(raw))
+                msg = json.loads(raw)
+                if isinstance(msg, dict) and msg.get("type") == "session_end":
+                    logger.info("📝 Session end — saving conversation log")
+                    save_conversation_log(state["history"])
+                await state["queue"].put(msg)
         except WebSocketDisconnect:
             logger.info("Frontend disconnected")
         except Exception as exc:
             logger.error(f"read_from_frontend: {exc}", exc_info=True)
         finally:
+            if state["history"]:
+                save_conversation_log(state["history"])
             state["frontend_gone"] = True
             await state["queue"].put(None)
             await ws_send_queue.put(None)
 
-    # ── Main Gemini session loop with auto-reconnect + exponential backoff ─────
     async def gemini_session_loop():
-        retry_count = 0
-        max_retries = 10
+        retry_count  = 0
+        max_retries  = 10
         STOP_SESSION = object()
 
         while True:
             state["queue"] = asyncio.Queue()
             logger.info(
-                f"🔄 Opening Gemini session "
+                f"🔄 Opening session "
                 f"(history={len(state['history'])} turns, retry={retry_count})..."
             )
 
@@ -398,7 +453,6 @@ async def vera_websocket(websocket: WebSocket):
                 ) as session:
                     logger.info("✅ Gemini Live session opened")
 
-                    # ── Send audio / video / text to Gemini ───────────────────
                     async def send_to_gemini():
                         while True:
                             msg = await state["queue"].get()
@@ -446,7 +500,7 @@ async def vera_websocket(websocket: WebSocket):
                                             "role": "user",
                                             "text": f"[system]: {text_data[:80]}",
                                         })
-                                        logger.info(f"📝 Text injected: {text_data[:60]}")
+                                        logger.info(f"📝 Injected: {text_data[:60]}")
                                 except Exception as exc:
                                     logger.warning(f"Text inject failed: {exc}")
 
@@ -454,20 +508,19 @@ async def vera_websocket(websocket: WebSocket):
                                 try:
                                     await send_ws({"type": "pong"})
                                 except Exception as exc:
-                                    logger.warning(f"Ping response failed: {exc}")
+                                    logger.warning(f"Ping failed: {exc}")
 
-                    # ── Receive responses from Gemini ──────────────────────────
                     async def receive_from_gemini():
                         try:
                             async for message in session.receive():
                                 sc = getattr(message, "server_content", None)
                                 if sc is None:
-                                    logger.debug(f"Non-content message: {message}")
                                     continue
 
                                 model_turn = getattr(sc, "model_turn", None)
                                 if model_turn:
                                     for part in model_turn.parts:
+                                        # Audio → send to frontend for playback
                                         if part.inline_data:
                                             await send_ws({
                                                 "type": "audio",
@@ -475,7 +528,10 @@ async def vera_websocket(websocket: WebSocket):
                                                     part.inline_data.data
                                                 ).decode(),
                                             })
-                                            logger.info(f"🔊 {len(part.inline_data.data)}b audio sent")
+                                            logger.info(f"🔊 {len(part.inline_data.data)}b")
+
+                                        # Text → buffer for [MEM:...] parsing only
+                                        # Never sent to frontend as speech
                                         if part.text:
                                             state["response_buffer"].append(part.text)
 
@@ -485,13 +541,14 @@ async def vera_websocket(websocket: WebSocket):
 
                                     clean_text, mem_markers = process_memory_markers(raw_text)
 
-                                    # Save memories and notify frontend
                                     icons = {
                                         "semantic":   "👤",
                                         "episodic":   "📖",
                                         "preference": "⚙️",
                                         "events":     "📅",
+                                        "speaker":    "🧑",
                                     }
+
                                     for category, value in mem_markers:
                                         saved = add_memory(category.lower(), value.strip())
                                         if saved:
@@ -510,24 +567,22 @@ async def vera_websocket(websocket: WebSocket):
                                             "role": "vera",
                                             "text": clean_text,
                                         })
-                                        # Keep history bounded
                                         if len(state["history"]) > MAX_HISTORY * 2:
                                             state["history"] = state["history"][-(MAX_HISTORY * 2):]
-                                        logger.info(f"✅ Turn complete. History={len(state['history'])}")
+                                        logger.info(f"✅ Turn done. History={len(state['history'])}")
 
                                     await send_ws({"type": "turn_complete"})
 
                                 if getattr(sc, "interrupted", False):
                                     state["response_buffer"] = []
                                     await send_ws({"type": "interrupted"})
-                                    logger.info("⚡ Interrupted by host")
+                                    logger.info("⚡ Interrupted")
 
                         except websockets.exceptions.ConnectionClosedError as exc:
-                            logger.warning(f"Gemini connection closed: {exc}")
+                            logger.warning(f"Gemini closed: {exc}")
                         except Exception as exc:
-                            logger.error(f"receive_from_gemini error: {exc}", exc_info=True)
+                            logger.error(f"receive_from_gemini: {exc}", exc_info=True)
 
-                    # Run send and receive concurrently
                     t_send    = asyncio.create_task(send_to_gemini(),      name="send")
                     t_receive = asyncio.create_task(receive_from_gemini(), name="receive")
 
@@ -543,11 +598,11 @@ async def vera_websocket(websocket: WebSocket):
                             pass
 
                     if state["frontend_gone"]:
-                        logger.info("Frontend gone — shutting down session loop")
+                        logger.info("Frontend gone — stopping")
                         update_timeline()
                         return
 
-                    logger.info("♻️  Session ended — reconnecting in 0.1s...")
+                    logger.info("♻️  Reconnecting in 0.1s...")
                     await asyncio.sleep(0.1)
 
             except Exception as exc:
@@ -555,7 +610,7 @@ async def vera_websocket(websocket: WebSocket):
                 retry_count += 1
 
                 if retry_count >= max_retries:
-                    logger.error(f"Max retries ({max_retries}) reached. Stopping.")
+                    logger.error(f"Max retries reached.")
                     try:
                         await send_ws({
                             "type":    "error",
@@ -566,7 +621,7 @@ async def vera_websocket(websocket: WebSocket):
                     return
 
                 backoff = min(2 ** retry_count, 30) * (0.5 + random.random())
-                logger.info(f"Retrying in {backoff:.1f}s (attempt {retry_count}/{max_retries})...")
+                logger.info(f"Retrying in {backoff:.1f}s ({retry_count}/{max_retries})...")
 
                 if retry_count == 1:
                     try:
@@ -580,9 +635,8 @@ async def vera_websocket(websocket: WebSocket):
                 await asyncio.sleep(backoff)
 
             else:
-                retry_count = 0  # Reset on clean session
+                retry_count = 0
 
-    # Run all three coroutines concurrently
     try:
         await asyncio.gather(
             read_from_frontend(),
@@ -590,9 +644,9 @@ async def vera_websocket(websocket: WebSocket):
             ws_writer(),
         )
     except Exception as exc:
-        logger.error(f"Top-level gather error: {exc}", exc_info=True)
+        logger.error(f"Top-level error: {exc}", exc_info=True)
     finally:
-        logger.info("🧹 WebSocket session cleaned up")
+        logger.info("🧹 Cleaned up")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -625,10 +679,25 @@ async def get_category_memories(category: str):
         return {"error": str(e)}
 
 
+@app.get("/logs")
+async def get_conversation_logs():
+    """Return all saved conversation logs."""
+    try:
+        docs = (
+            _user_ref()
+            .collection("conversation_logs")
+            .order_by("timestamp")
+            .stream()
+        )
+        return {"logs": [d.to_dict() for d in docs]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.delete("/memories/{category}")
 async def clear_memory_category(category: str):
     if category not in MEMORY_CATEGORIES and category != "all":
-        return {"error": f"Valid categories: {MEMORY_CATEGORIES} or 'all'"}
+        return {"error": f"Valid: {MEMORY_CATEGORIES} or 'all'"}
     try:
         cats = MEMORY_CATEGORIES if category == "all" else [category]
         for cat in cats:
