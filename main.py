@@ -62,7 +62,7 @@ app.add_middleware(
 
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
 MODEL             = "gemini-2.5-flash-native-audio-preview-12-2025"
-MEMORY_MODEL     = "gemini-3.1-flash-lite"  # 15 RPM, 500 RPD free tier — best available
+MEMORY_MODEL     = "gemini-2.5-flash-lite"  # 15 RPM, 500 RPD free tier — best available
 MEMORY_EXTRACT_EVERY = 3   # run memory extraction every N turns to avoid quota exhaustion
 MAX_HISTORY       = 30
 USER_ID           = os.getenv("VERA_USER_ID", "default_host")
