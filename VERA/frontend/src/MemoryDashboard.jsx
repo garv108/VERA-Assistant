@@ -47,7 +47,7 @@ export default function MemoryDashboard({ onBack }) {
       setMemories(data);
     } catch (e) {
       console.error("Failed to load memories", e);
-      setError("Could not reach VERA backend. Is Railway running?");
+      setError("Could not reach VERA backend. Is Render running?");
     }
     setLoading(false);
   }, []);

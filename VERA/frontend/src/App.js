@@ -4,7 +4,6 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import MemoryDashboard from "./MemoryDashboard";
 
 const WS_URL = "wss://vera-assistant-9dj8.onrender.com/ws/vera";
-
 const AUDIO_SAMPLE_RATE = 16000;
 const VIDEO_INTERVAL_MS = 5000;
 const FLUSH_INTERVAL_MS = 50;
@@ -141,9 +140,9 @@ function ThinkingDots() {
 const ONBOARD_STEPS = [
   "What's your name?",
   "What city are you in?",
-    "What do you do for work?",
-    "What's one thing you're working on right now?",
-    "How do you prefer I talk to you — formal or casual?"
+  "What do you do for work?",
+  "What's one thing you're working on right now?",
+  "How do you prefer I talk to you — formal or casual?"
 ];
 
 export default function App() {
@@ -483,7 +482,7 @@ export default function App() {
 
     // Fetch stored memory count from Firestore on mount
     // This tells us if VERA has met the host before (skip onboarding if yes)
-fetch("https://vera-assistant-9dj8.onrender.com/memories")
+    fetch("https://vera-assistant-9dj8.onrender.com/memories")
       .then(r => r.json())
       .then(data => {
         if (!mountedRef.current) return;
