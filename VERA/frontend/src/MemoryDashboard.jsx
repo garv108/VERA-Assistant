@@ -2,7 +2,7 @@
 // Supports all 5 memory categories: semantic, preference, events, episodic, speaker
 import { useState, useEffect, useCallback } from "react";
 
-const API = "https://vera-assistant-production.up.railway.app";
+const API = "https://vera-assistant-9dj8.onrender.com";
 
 const CATS = {
   semantic:   { label: "Identity",    icon: "👤", color: "#00d4ff", desc: "Who you are" },
