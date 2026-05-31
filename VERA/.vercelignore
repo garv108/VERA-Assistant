@@ -1,0 +1,6 @@
+# Exclude everything except the frontend
+*
+!frontend/
+!frontend/**
+!.vercelignore
+!vercel.json
