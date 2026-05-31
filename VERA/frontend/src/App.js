@@ -3,8 +3,10 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import MemoryDashboard from "./MemoryDashboard";
 
-const WS_URL = "wss://vera-assistant-9dj8.onrender.com/ws/vera";
-const AUDIO_SAMPLE_RATE = 16000;
+const API_URL = process.env.REACT_APP_API_URL || "http://localhost:8000";
+const wsProtocol = API_URL.startsWith("https") ? "wss" : "ws";
+const wsHost = API_URL.replace(/^https?:\/\//, "");
+const WS_URL = `${wsProtocol}://${wsHost}/ws/vera`;const AUDIO_SAMPLE_RATE = 16000;
 const VIDEO_INTERVAL_MS = 5000;
 const FLUSH_INTERVAL_MS = 50;
 const PROACTIVE_SILENCE_MS = 120000; // 2 minutes — VERA checks in
@@ -482,7 +484,7 @@ export default function App() {
 
     // Fetch stored memory count from Firestore on mount
     // This tells us if VERA has met the host before (skip onboarding if yes)
-    fetch("https://vera-assistant-9dj8.onrender.com/memories")
+    fetch(`${API_URL}/memories`)
       .then(r => r.json())
       .then(data => {
         if (!mountedRef.current) return;

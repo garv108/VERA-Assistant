@@ -1,9 +1,9 @@
 // MemoryDashboard.jsx - VERA Memory Dashboard
 // Supports all 5 memory categories: semantic, preference, events, episodic, speaker
 import { useState, useEffect, useCallback } from "react";
+const API_URL = process.env.REACT_APP_API_URL || "http://localhost:8000";
 
-const API = "https://vera-assistant-9dj8.onrender.com";
-
+const API = API_URL;
 const CATS = {
   semantic:   { label: "Identity",    icon: "👤", color: "#00d4ff", desc: "Who you are" },
   preference: { label: "Preferences", icon: "⚙️", color: "#a78bfa", desc: "How you like things" },
